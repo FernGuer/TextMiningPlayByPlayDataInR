@@ -1,0 +1,420 @@
+######################
+#analysis of play by play dataset
+#original play-by-play (pbp) data can be found @ NFLSavant.com
+Season2013 = read.csv("pbp-2013.csv", header = TRUE, stringsAsFactors = FALSE) #errors (3684:4153, 10k)
+Season2013 = Season2013[-c(3684:4153,10000),]
+Season2014 = read.csv("pbp-2014.csv", header = TRUE, stringsAsFactors = FALSE)
+Season2015 = read.csv("pbp-2015.csv", header = TRUE, stringsAsFactors = FALSE)
+Season2016 = read.csv("pbp-2016.csv", header = TRUE, stringsAsFactors = FALSE)
+Season2017 = read.csv("pbp-2017.csv", header = TRUE, stringsAsFactors = FALSE)
+
+DataRebuild = function(SeasonData) {
+
+  Extras = c("X","X.1","X.2","X.3","NextScore","TeamWin")
+  SeasonData = SeasonData[,-which(colnames(SeasonData) %in% Extras)]
+
+  #remove plays that contain no player event data, exclude time out (note, they are mutually exclusive)
+  NonPlayerTerms = c("^END GAME", "^END OF GAME", "^END OF HALF", "^END OF QUARTER",
+                     "^END OF REGULATION", "^END QUARTER", "^TWO\\-MINUTE WARNING")
+
+  #find all free text containing non-player event data
+  NonPlayerEvents = matrix(ncol = length(NonPlayerTerms), nrow = nrow(SeasonData))
+  for (i in 1:length(NonPlayerTerms)) {
+    NonPlayerEvents[,i] = ifelse(regexpr(NonPlayerTerms[i], SeasonData[,"Description"]) == -1, 0, 1)
+  }
+  #find count for which at least 1 non-player event is present in description
+  NonPlayerEvents = rowSums(NonPlayerEvents)
+
+  #remove non-player rows
+  SeasonData = SeasonData[-which(NonPlayerEvents == 1),]
+
+  #plays that are labeled 'NO PLAY' generate no yardage, remove 'Yards' values for that subset
+  SeasonData[which(SeasonData[,"IsNoPlay"] == 1), "Yards"] = 0
+
+  #plays that are interceptions generate no yardage for QB/WR, but may generate interstitial yds for opponent
+  SeasonData[which(SeasonData[,"IsInterception"] == 1), "Yards"] = 0
+
+  #convert NO GAIN to 0 yards to facilitate yardage calculations
+  SeasonData[,"Description"] = gsub("NO GAIN", "0 YARDS", SeasonData[,"Description"])
+
+  #variables to add: YACYds, AirYds, IsSafety, IsTouchback, IsFalseStart, IsInterference,
+  #IsUnnecessaryRoughness, IsNZInfraction, IsRoughing, IsSpiked
+
+  #identify descriptions that include Yards-After-Catch and Through-the-Air data, identify string location
+  YACFinder = regexpr("YAC [\\-]{0,1}[0-9][0-9]*", SeasonData[,"Description"])
+  AirFinder = regexpr("PASS [\\-]{0,1}[0-9][0-9]*", SeasonData[,"Description"])
+
+  #if YAC/PASS are present & location in description is known, extract substring containg YAC/PASS data
+  YACYds = AirYds = c()
+  for (i in 1:nrow(SeasonData)) {
+    YACYds[i] = ifelse(YACFinder[i] > 0, substring(SeasonData[i,"Description"],
+                                                   YACFinder[i] + 3,YACFinder[i] + 5),0)
+    AirYds[i] = ifelse(AirFinder[i] > 0, substring(SeasonData[i,"Description"],
+                                                   AirFinder[i] + 4,AirFinder[i] + 6),0)
+  }
+
+  #remove extraneous punctuation
+  YACYds = gsub(",|\\.|\\s","",YACYds); AirYds = gsub(",|\\s|\\-$","",AirYds)
+  #convert to numeric data
+  YACYds = as.numeric(YACYds); AirYds = as.numeric(AirYds)
+  #append to dataset
+  SeasonData$YACYds = YACYds; SeasonData$AirYds = AirYds
+
+  SeasonData$IsSafety = ifelse(regexpr("SAFETY",SeasonData$Description) > 0, 1,0)
+  SeasonData$IsTouchback = ifelse(regexpr("TOUCHBACK",SeasonData$Description) > 0, 1,0)
+  SeasonData$IsFalseStart = ifelse(regexpr("FALSE START",SeasonData$Description) > 0 , 1,0)
+  SeasonData$IsInterference = ifelse(regexpr("INTERFERENCE",SeasonData$Description) > 0 , 1,0)
+  SeasonData$IsUnnecessaryRoughness = ifelse(regexpr("UNNECESSARY ROUGHNESS",SeasonData$Description) > 0 , 1,0)
+  SeasonData$IsNZInfraction = ifelse(regexpr("NEUTRAL ZONE INFRACTION",SeasonData$Description) > 0 , 1,0)
+  SeasonData$IsRoughing = ifelse(regexpr("ROUGHING THE PASSER",SeasonData$Description) > 0 , 1,0)
+  SeasonData$IsSpiked = ifelse(regexpr("SPIKED",SeasonData$Description) > 0 , 1,0)
+  SeasonData[which(SeasonData$Description == ""),"Description"] = "NOT AVAILABLE"
+
+  #extract Yards data from pbp, noting that extracting only the 1st instance of FOR xx YARDS may generate erroneous data when multiple events occur in one play, i.e. precedence problem
+
+  #free text mining description data by splitting each at sentence break points
+  Descriptions = strsplit(SeasonData$Description, "\\. ")
+
+  #identify how many sentences each description contains (also a few mistyped player designators)
+  Lengths = c(); for (i in 1:length(Descriptions)) Lengths[i] = length(Descriptions[[i]])
+
+  #structure pbp descriptions by row, placing each sentence (char string) in a matrix cell
+  DescriptionMatrix = matrix(nrow = nrow(SeasonData), ncol = max(Lengths))
+  for (i in 1:length(Descriptions)) {
+    for (k in 1:Lengths[i]) {
+      DescriptionMatrix[i,k] = Descriptions[[i]][k]
+    }
+  }
+  #since description lengths differ, remove DescriptionMatrix NAs
+  DescriptionMatrix = ifelse(is.na(DescriptionMatrix), "NONE", DescriptionMatrix)
+
+  #identify non-continuous play data (e.g. multiple intermediate events happen before final 'Yards' count)
+  #identify the location within each DescriptionMatrix cell where the 'Yards' RegEx is found
+  #use LocationFinder to extract the substring containing yardage information from DescriptionMatrix
+  LocationFinder = YardsMatrix = matrix(nrow = nrow(DescriptionMatrix), ncol = max(Lengths))
+  for (i in 1:nrow(DescriptionMatrix)) {
+    LocationFinder[i,] = regexpr(" FOR [\\-]*[0-9]{1,3} YARDS?", DescriptionMatrix[i,])
+    YardsMatrix[i,] = ifelse(LocationFinder[i,] != -1,
+                             substring(DescriptionMatrix[i,],
+                                       LocationFinder[i,] + 5, LocationFinder[i,] + 7),0)
+  }
+
+  #remove spaces and Ys that may encompass the scope used (limited to -99:100, i.e. Location + 5:7)
+  YardsMatrix = gsub("\\s+|Y","", YardsMatrix)
+  colnames(YardsMatrix) = rep("InterstitialYards", ncol(YardsMatrix))
+  #sort each row from highest to lowest value
+  for (i in 1:nrow(YardsMatrix)) YardsMatrix[i,] = sort(YardsMatrix[i,], decreasing = TRUE, method = "quick")
+
+  #find column population; remove superfluous columns; alternative: sapply(which(YardsMatrix[,i] !=0) length)
+  YardsMatNonZero = c(); for (i in 1:ncol(YardsMatrix)) YardsMatNonZero[i] = length(which(YardsMatrix[,i] != 0))
+  YardsMatrix = YardsMatrix[,-which(YardsMatNonZero == 0)]
+
+  #find rows containing multiple non-zero yardage values
+  InterstitialYardCount = c()
+  for (i in 1:nrow(YardsMatrix)) InterstitialYardCount[i] = length(which(YardsMatrix[i,] != 0))
+  #append to YardsMatrix
+  YardsMatrix = cbind(YardsMatrix, InterstitialYardCount)
+
+  #extract column names from SeasonData
+  VarNames = colnames(SeasonData)
+
+  #collocate YardsMatrix with original (occasionally inaccurate) yardage data
+  SeasonData = data.frame(SeasonData[,VarNames[1:14]], YardsMatrix, SeasonData[,VarNames[15:length(VarNames)]])
+  return(SeasonData)
+}
+
+Season2013 = DataRebuild(Season2013) #incomplete and misplaced description data (3684:4153, 10000)
+Season2014 = DataRebuild(Season2014)
+Season2015 = DataRebuild(Season2015)
+Season2016 = DataRebuild(Season2016)
+Season2017 = DataRebuild(Season2017)
+
+#end of dataset reconstruction
+############################################################
+############################################################
+#begin team level data
+#Teams = unique(Season2016$DefenseTeam)
+#[1] "TB"  "CHI" "GB"  "OAK" "NO" "NYJ" "PHI" "CLE" "TEN" "MIN"
+#[11] "CAR" "NE"  "MIA" "SEA" "DAL" "NYG" "DET" "IND" "ARI" "BUF"
+#[21] "SF"  "BAL" "KC"  "HOU" "PIT" "CIN" "WAS" "LA"  "DEN" "ATL"
+#[31] "SD"  "JAX
+
+#end team level EDA
+############################################################
+#extract each player name to identify what kind of measurable events they participated in, i.e. plays in which a statistic was logged on their behalf
+
+#identify each player with an attributed measurable statistic from play-by-play data
+PlayerListBySeason = function(SeasonData) {
+
+  #find and extract all instances of player pattern NumNum-Initial.LastName
+  Players = regmatches(SeasonData[,"Description"], gregexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)?", SeasonData[,"Description"]))
+
+  #identify player frequencies by first extracting their names from play-by-play descriptions
+  PlayerExtraction = function(Players, SeasonData){
+
+    #find how many players participated in measurable events for each play
+    PerPlay = lapply(Players, length)
+    #generate a vector containing the total count of players for each play
+    TotalCount = c(); for (i in 1:length(PerPlay)) { TotalCount[i] = PerPlay[[i]][1] }
+    #identify the largest number of players participating in a play
+    LongestList = max(TotalCount)
+    #place all participants in a matrix for unique identification
+    UniquePlayers = matrix(nrow = nrow(SeasonData), ncol = LongestList)
+    for (i in 1:nrow(SeasonData)) {
+      for (k in 1:TotalCount[[i]]) {
+        UniquePlayers[i,k] = Players[[i]][k]
+      }
+    }
+    #remove superfluous end spaces
+    UniquePlayers = gsub("\\s$","", UniquePlayers)
+  }
+  #this data can be expanded, depending on the RegEx used and attribute targeted (e.g. penalty, pass, tackle, etc.)
+  #UniqueTacklers = PlayerExtraction(Tacklers, SeasonData) #using a modified RegEx one can extract tackle frequencies
+  UniquePlayers = PlayerExtraction(Players, SeasonData)
+
+  PlayerFrequencies = function(Uniques) {
+
+    #use table function to identify player frequencies; put in a user friendly matrix, order them
+    #identify each player's total plays with measurable events
+    Players = table(Uniques)
+    Players = as.matrix(Players)
+    Players = as.matrix(Players[order(-Players),])
+
+  }
+  PlayerNameNumber = PlayerFrequencies(UniquePlayers)
+
+  #label columns
+  colnames(PlayerNameNumber) = c("TotalPlays")
+
+  #convert to data frame
+  PlayerData = as.data.frame(PlayerNameNumber)
+  return(PlayerData)
+}
+
+#perform event frequency tabling for each season
+Players2013 = PlayerListBySeason(Season2013)
+Players2014 = PlayerListBySeason(Season2014)
+Players2015 = PlayerListBySeason(Season2015)
+Players2016 = PlayerListBySeason(Season2016)
+Players2017 = PlayerListBySeason(Season2017)
+
+#identify players with high counts of negative yielding yardage plays
+NegativePlays = function(PlayerNames, SeasonData) {
+
+  NegativePlays = matrix(nrow = length(rownames(PlayerNames)), ncol = 1)
+  for (i in 1:nrow(PlayerNames)) {
+    NegativePlays[i,1] = length(SeasonData[regexpr(rownames(PlayerNames)[i], SeasonData[,"Description"]) > 0
+                                          & SeasonData[,"Yards"] < 0,"Yards"])
+  }
+  rownames(NegativePlays) = rownames(PlayerNames)
+  colnames(NegativePlays) = c("NegativeYardPlays")
+  return(NegativePlays)
+}
+NegativePlays2017 = NegativePlays(Players2017, Season2017)
+
+#Rush statistics with player scope: 1-M.HUNT to 99-TOM.L.VAN'EHRET-MORIARITY JR.
+RushStatistics = function(SeasonData) {
+
+  #key: player, type of run, direction, stoppage location (or none, if TD), yardage gain
+  Rushes = regexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)?\\s?(SCRAMBLES)? (RIGHT END|RIGHT TACKLE|RIGHT GUARD|UP THE MIDDLE|LEFT GUARD|LEFT TACKLE|LEFT END) ((TO|PUSHED OB AT|RAN OB AT) [A-Z][A-Z][A-Z]? [0-9][0-9]? FOR|TO [0-9]*[0-9] FOR|FOR) (\\-?[0-9]?[0-9] YARDS?)",SeasonData$Description)
+  #extract the matches
+  Rushes = as.matrix(regmatches(SeasonData$Description, Rushes))
+  colnames(Rushes) = c("Description")
+
+  #identify all ball carriers
+  Rusher = regexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)?",Rushes)
+  #identify all yardage values
+  Yards = regexpr("\\-?[0-9]?[0-9] YARDS?", Rushes)
+  #identify all directions
+  Direction = regexpr("(RIGHT END|RIGHT TACKLE|RIGHT GUARD|UP THE MIDDLE|LEFT GUARD|LEFT TACKLE|LEFT END)", Rushes)
+
+  #extract ball carriers, yardage values, directions into separate variables
+  Rushes = cbind("Rusher" = regmatches(Rushes,Rusher),
+                 "Yards" = regmatches(Rushes,Yards),
+                 "Direction" = regmatches(Rushes,Direction), Rushes)
+  #remove extraneous data from yardage cells
+  Rushes[,"Yards"] = gsub(" YARDS?", "", Rushes[,"Yards"])
+  Rushes[,"Rusher"] = gsub("\\s$", "", Rushes[,"Rusher"])
+  #convert to data frame
+  Rushes = as.data.frame(Rushes)
+  #convert yards to numeric
+  Rushes$Yards = as.numeric(as.character(Rushes$Yards))
+  #convert names to characters
+  Rushes$Rusher = as.character(Rushes$Rusher)
+
+  return(Rushes)
+}
+
+RushStats2013 = RushStatistics(Season2013)
+RusherFreqStats2013 = as.data.frame(table(RushStats2013[,"Rusher"]))
+RusherDirectionStats2013 = as.data.frame(table(RushStats2013[,"Direction"]))
+
+RushStats2014 = RushStatistics(Season2014)
+RushStats2015 = RushStatistics(Season2015)
+RushStats2016 = RushStatistics(Season2016)
+
+RushStats2017 = RushStatistics(Season2017)
+RusherFreqStats2017 = as.data.frame(table(RushStats2017[,"Rusher"]))
+RusherDirectionStats2017 = as.data.frame(table(RushStats2017[,"Direction"]))
+
+#extract reception, incompletion and interception frequency data from pbp descriptions
+ReceiverStatistics = function(SeasonData) {
+
+  #completions by region and receiver
+  CompletionsByRegion = regexpr("PASS (SHORT|DEEP) (LEFT|MIDDLE|RIGHT) TO [0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)?", SeasonData$Description)
+
+  #incompletions by region and receiver
+  InCompletionsByRegion = regexpr("PASS INCOMPLETE (SHORT|DEEP) (LEFT|MIDDLE|RIGHT) TO [0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)?", SeasonData$Description)
+
+  #interceptions are designated by 'Intended for'
+  InterceptionsByRegion = regexpr("PASS (SHORT|DEEP) (LEFT|MIDDLE|RIGHT) INTENDED FOR [0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)?", SeasonData$Description)
+
+  #identify completions, incompletions and interceptions by player and region
+  WRExtraction = function(ByRegion,SeasonData) {
+    ByRegion = regmatches(SeasonData[,"Description"], ByRegion)
+    ByRegion = gsub("\\s$", "", ByRegion)
+    ByRegion = as.data.frame(table(ByRegion))
+  }
+
+  CompletionsByRegion = WRExtraction(CompletionsByRegion, SeasonData)
+  InCompletionsByRegion = WRExtraction(InCompletionsByRegion, SeasonData)
+  InterceptionsByRegion = WRExtraction(InterceptionsByRegion, SeasonData)
+
+  #label columns
+  colnames(CompletionsByRegion) = c("RegionWR", "Completions")
+  colnames(InCompletionsByRegion) = c("RegionWR", "InCompletions")
+  colnames(InterceptionsByRegion) = c("RegionWR", "Interceptions")
+
+  #remove the incomplete designator; metric is already identified by column label; facilitates merge (next step)
+  InCompletionsByRegion$RegionWR = gsub("INCOMPLETE ", "", InCompletionsByRegion$RegionWR)
+
+  #remove intended for (interception) designator
+  InterceptionsByRegion$RegionWR = gsub("INTENDED FOR ", "TO ", InterceptionsByRegion$RegionWR)
+
+  #compile completions and incompletions into a single dataset
+  WRStats = merge(CompletionsByRegion,InCompletionsByRegion, by = "RegionWR", all = TRUE)
+  WRStats = merge(WRStats,InterceptionsByRegion, by = "RegionWR", all = TRUE)
+
+  #extract receiver name to view data by RegionWR combination (i.e. potentially 6 regions for each receiver)
+  WRNames = regexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)?",
+                    WRStats$RegionWR)
+  PassDepth = regexpr("(SHORT|DEEP)", WRStats$RegionWR)
+  PassLoc = regexpr("(LEFT|MIDDLE|RIGHT)", WRStats$RegionWR)
+  WRStats = cbind("WRName" = regmatches(WRStats$RegionWR, WRNames),
+                  "PassDepth" = regmatches(WRStats$RegionWR, PassDepth),
+                  "PassLocation" = regmatches(WRStats$RegionWR, PassLoc), WRStats)
+  WRStats[which(is.na(WRStats[,"Completions"])),"Completions"] = 0
+  WRStats[which(is.na(WRStats[,"InCompletions"])),"InCompletions"] = 0
+  WRStats[which(is.na(WRStats[,"Interceptions"])),"Interceptions"] = 0
+  #calculate total opportunities
+  WRStats$Targets = WRStats[,"Completions"] + WRStats[,"InCompletions"] + WRStats[,"Interceptions"]
+  #calculate conversion rate by player and region
+  WRStats$CompletionRate = WRStats[,"Completions"] / WRStats[,"Targets"]
+
+  return(WRStats)
+}
+
+#receiver completions, incompletions, interceptions and total targets by season
+WR2013Stats = ReceiverStatistics(Season2013)
+WR2014Stats = ReceiverStatistics(Season2014)
+WR2015Stats = ReceiverStatistics(Season2015)
+WR2016Stats = ReceiverStatistics(Season2016)
+WR2017Stats = ReceiverStatistics(Season2017)
+
+#identify Qb and WR combinations, conversions, failures, interceptions and conversion rates
+QBWRStatistics = function(SeasonData) {
+
+  #alternate script for QB extraction by depth and region of passes, use w/ PlayerListBySeason function
+  #CompletionsByRegionSL = regmatches(SeasonData[,"Description"], gregexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)? PASS (SHORT) (LEFT)", SeasonData[,"Description"]))
+  #CompletionsByRegionSM = regmatches(SeasonData[,"Description"], gregexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)? PASS (SHORT) (MIDDLE)", SeasonData[,"Description"]))
+  #CompletionsByRegionSR = regmatches(SeasonData[,"Description"], gregexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)? PASS (SHORT) (RIGHT)", SeasonData[,"Description"]))
+  #CompletionsByRegionSR = regmatches(SeasonData[,"Description"], gregexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)? PASS (DEEP) (LEFT)", SeasonData[,"Description"]))
+  #CompletionsByRegionSR = regmatches(SeasonData[,"Description"], gregexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)? PASS (DEEP) (MIDDLE)", SeasonData[,"Description"]))
+  #CompletionsByRegionSR = regmatches(SeasonData[,"Description"], gregexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)? PASS (DEEP) (RIGHT)", SeasonData[,"Description"]))
+  
+  #completions by passer, region and receiver
+  CompletionsByRegion = regexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)? PASS (SHORT|DEEP) (LEFT|MIDDLE|RIGHT) TO [0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)?", SeasonData$Description)
+
+  #incompletions by passer, region and receiver
+  InCompletionsByRegion = regexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)? PASS INCOMPLETE (SHORT|DEEP) (LEFT|MIDDLE|RIGHT) TO [0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)?", SeasonData$Description)
+
+  #interceptions are identified by "intended for"
+  InterceptionsByRegion = regexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)? PASS (SHORT|DEEP) (LEFT|MIDDLE|RIGHT) INTENDED FOR [0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)?", SeasonData$Description)
+
+  QBWRExtraction = function(ByRegion, SeasonData) {
+    ByRegion = regmatches(SeasonData[,"Description"], ByRegion)
+    ByRegion = gsub("\\s$", "", ByRegion)
+    ByRegion = as.data.frame(table(ByRegion))
+  }
+
+  CompletionsByRegion = QBWRExtraction(CompletionsByRegion, SeasonData)
+  InCompletionsByRegion = QBWRExtraction(InCompletionsByRegion, SeasonData)
+  InterceptionsByRegion = QBWRExtraction(InterceptionsByRegion, SeasonData)
+
+  #label columns
+  colnames(CompletionsByRegion) = c("RegionQBWR", "Completions")
+  colnames(InCompletionsByRegion) = c("RegionQBWR", "InCompletions")
+  colnames(InterceptionsByRegion) = c("RegionQBWR", "Interceptions")
+
+  #remove the incomplete designator; metric is already identified by column label; facilitates merge (next step)
+  InCompletionsByRegion$RegionQBWR = gsub("INCOMPLETE ", "", InCompletionsByRegion$RegionQBWR)
+  
+  #remove intended for (interception) designator, convert to standard "TO" for merge
+  InterceptionsByRegion$RegionQBWR = gsub("INTENDED FOR ", "TO ", InterceptionsByRegion$RegionQBWR)
+
+  #compile completions, incompletions and interceptions into a single dataset
+  QBStats = merge(CompletionsByRegion,InCompletionsByRegion, by = "RegionQBWR", all = TRUE)
+  QBStats = merge(QBStats, InterceptionsByRegion, by = "RegionQBWR", all = TRUE)
+
+  #extract QB/WR names to view data by QB or WR or Region
+  QBNames = regexpr("[0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)?",
+                          QBStats$RegionQBWR)
+
+  WRNames = regexpr("TO [0-9][0-9]?\\-[A-Z]+\\.[A-Z]?\\.?[A-Z]+'?[A-Z]?\\-?[A-Z]+\\s?(II|III|JR\\.?)?",
+                    QBStats$RegionQBWR)
+
+  PassDepth = regexpr("(SHORT|DEEP)", QBStats$RegionQBWR)
+  PassLoc = regexpr("(LEFT|MIDDLE|RIGHT)", QBStats$RegionQBWR)
+  QBStats = cbind("QBName" = regmatches(QBStats$RegionQBWR, QBNames),
+                  "WRName" = regmatches(QBStats$RegionQBWR, WRNames),
+                  "PassDepth" = regmatches(QBStats$RegionQBWR, PassDepth),
+                  "PassLocation" = regmatches(QBStats$RegionQBWR, PassLoc), QBStats)
+  #remove superfluous characters
+  QBStats$QBName = gsub("\\s$", "", QBStats$QBName)
+  QBStats$WRName = gsub("TO\\s|\\s$", "", QBStats$WRName)
+
+  QBStats[which(is.na(QBStats[,"Completions"])),"Completions"] = 0
+  QBStats[which(is.na(QBStats[,"InCompletions"])),"InCompletions"] = 0
+  QBStats[which(is.na(QBStats[,"Interceptions"])),"Interceptions"] = 0
+  #calculate total opportunities
+  QBStats$Targets = QBStats[,"Completions"] + QBStats[,"InCompletions"] + QBStats[,"Interceptions"]
+  #calculate conversion rate by QBWR pair and region
+  QBStats$CompletionRate = QBStats[,"Completions"] / QBStats[,"Targets"]
+  return(QBStats)
+}
+
+QBWR2013Stats = QBWRStatistics(Season2013)
+QBWR2014Stats = QBWRStatistics(Season2014)
+QBWR2015Stats = QBWRStatistics(Season2015)
+QBWR2016Stats = QBWRStatistics(Season2016)
+QBWR2017Stats = QBWRStatistics(Season2017)
+
+#note the match, despite QBWR count and WR count being different
+#length(unique(QBWR2017Stats$WRName))
+#[1] 331
+#> length(unique(WR2017Stats$WRName))
+#[1] 331
+
+#EDA QB by player
+A.Rodgers2017 = QBWR2017Stats[which(QBWR2017Stats[,"QBName"] == "12-A.RODGERS"),]
+
+#EDA Receiving by player
+A.Brown2017 = QBWR2017Stats[which(QBWR2017Stats[,"WRName"] == "84-A.BROWN"),]
+
+#EDA Rushing by player
+D.Cook2017 = RushStats2017[which(RushStats2017[,"Rusher"] == "33-D.COOK"),]
+
+###############################
+#predictive analytics
+
+
